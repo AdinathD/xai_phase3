@@ -44,25 +44,38 @@ if 'outcome' not in col_lower:
             break
 df['Outcome'] = df['Outcome'].astype(int)
 
-# Core Preprocessing Shared by Both
+# 1. Separate features (X) and target (y)
+X = df[[c for c in df.columns if c != 'Outcome']]
+y = df['Outcome']
+
+# 2. Perform train_test_split first (70/30 split, stratified)
+X_train_raw, X_test_raw, y_train, y_test = train_test_split(
+    X, y, test_size=0.3, random_state=RANDOM_SEED, stratify=y
+)
+
+# 3. Perform mean imputation on the zero_cols (Fit on Train, apply to both)
 zero_cols = ['Glucose', 'BloodPressure', 'SkinThickness', 'Insulin', 'BMI']
-zero_cols = [c for c in zero_cols if c in df.columns]
-df[zero_cols] = df[zero_cols].replace(0, np.nan)
-for col in zero_cols: df[col] = df[col].fillna(df[col].mean())
-for col in df.select_dtypes(include=[np.number]).columns:
-    if col != 'Outcome': df[col] = df[col].fillna(df[col].mean())
+zero_cols = [c for c in zero_cols if c in X_train_raw.columns]
 
-df_clean = df.copy()
-for col in [c for c in df.columns if c != 'Outcome']:
-    Q1, Q3 = df_clean[col].quantile(0.25), df_clean[col].quantile(0.75)
-    IQR = Q3 - Q1
-    df_clean = df_clean[(df_clean[col] >= Q1 - 1.5 * IQR) & (df_clean[col] <= Q3 + 1.5 * IQR)]
+X_train_imputed = X_train_raw.copy()
+X_test_imputed = X_test_raw.copy()
 
-X = df_clean[[c for c in df.columns if c != 'Outcome']]
-y = df_clean['Outcome']
+X_train_imputed[zero_cols] = X_train_imputed[zero_cols].replace(0, np.nan)
+X_test_imputed[zero_cols] = X_test_imputed[zero_cols].replace(0, np.nan)
 
+for col in zero_cols:
+    train_mean = X_train_imputed[col].mean()
+    X_train_imputed[col] = X_train_imputed[col].fillna(train_mean)
+    X_test_imputed[col] = X_test_imputed[col].fillna(train_mean)
+
+for col in X_train_imputed.select_dtypes(include=[np.number]).columns:
+    train_mean = X_train_imputed[col].mean()
+    X_train_imputed[col] = X_train_imputed[col].fillna(train_mean)
+    X_test_imputed[col] = X_test_imputed[col].fillna(train_mean)
+
+# 4. Apply SMOTE only to the Training set
 smote = SMOTE(random_state=RANDOM_SEED)
-X_res, y_res = smote.fit_resample(X, y)
+X_train_res, y_train_res = smote.fit_resample(X_train_imputed, y_train)
 """))
 
     # =========================================================================
@@ -74,18 +87,19 @@ X_res, y_res = smote.fit_resample(X, y)
     cells.append(nbf.v4.new_code_cell("""# A1. XGBoost Feature Mapping & Training
 cv5 = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_SEED)
 rfe_fold_features = []
-for train_idx, _ in cv5.split(X_res, y_res):
+for train_idx, _ in cv5.split(X_train_res, y_train_res):
     rfe = RFE(estimator=LGBMClassifier(random_state=RANDOM_SEED, verbose=-1), n_features_to_select=5)
-    rfe.fit(X_res.iloc[train_idx], y_res.iloc[train_idx])
-    rfe_fold_features.extend(X_res.columns[rfe.support_].tolist())
+    rfe.fit(X_train_res.iloc[train_idx], y_train_res.iloc[train_idx])
+    rfe_fold_features.extend(X_train_res.columns[rfe.support_].tolist())
 
 rfe_features = [f for f, cnt in Counter(rfe_fold_features).items() if cnt >= 3]
 print(f"RFE dynamically selected {len(rfe_features)} features: {rfe_features}")
 
-X_rfe_main = X_res[rfe_features]
-X_train_xgb, X_test_xgb, y_train_xgb, y_test_xgb = train_test_split(
-    X_rfe_main, y_res, test_size=0.3, random_state=RANDOM_SEED, stratify=y_res
-)
+X_train_xgb = X_train_res[rfe_features]
+X_test_xgb = X_test_imputed[rfe_features]
+
+y_train_xgb = y_train_res
+y_test_xgb = y_test
 
 xgb_model = XGBClassifier(random_state=RANDOM_SEED, eval_metric='logloss', verbosity=0)
 xgb_model.fit(X_train_xgb, y_train_xgb)
@@ -315,11 +329,11 @@ for p, idx in xgb_patients.items():
 boruta_features = ['Glucose', 'BMI', 'DiabetesPedigreeFunction', 'Age']
 print(f"Boruta (Paper Configuration) selected {len(boruta_features)} features: {boruta_features}")
 
-X_bor_main = X_res[boruta_features]
+X_train_lgb = X_train_res[boruta_features]
+X_test_lgb = X_test_imputed[boruta_features]
 
-X_train_lgb, X_test_lgb, y_train_lgb, y_test_lgb = train_test_split(
-    X_bor_main, y_res, test_size=0.3, random_state=RANDOM_SEED, stratify=y_res
-)
+y_train_lgb = y_train_res
+y_test_lgb = y_test
 
 lgbm_model = LGBMClassifier(random_state=RANDOM_SEED, verbose=-1)
 lgbm_model.fit(X_train_lgb, y_train_lgb)
