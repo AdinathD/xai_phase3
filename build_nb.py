@@ -23,7 +23,7 @@ from lightgbm import LGBMClassifier
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.feature_selection import RFE
 from sklearn.metrics import classification_report, confusion_matrix
-from imblearn.over_sampling import RandomOverSampler
+from imblearn.over_sampling import SMOTE
 from collections import Counter
 import warnings
 import zipfile
@@ -61,8 +61,8 @@ for col in [c for c in df.columns if c != 'Outcome']:
 X = df_clean[[c for c in df.columns if c != 'Outcome']]
 y = df_clean['Outcome']
 
-ros = RandomOverSampler(random_state=RANDOM_SEED)
-X_res, y_res = ros.fit_resample(X, y)
+smote = SMOTE(random_state=RANDOM_SEED)
+X_res, y_res = smote.fit_resample(X, y)
 """))
 
     # =========================================================================
