@@ -84,6 +84,150 @@ smote = SMOTE(random_state=RANDOM_SEED)
 X_train_res, y_train_res = smote.fit_resample(X_train_imputed, y_train)
 """))
 
+    cells.append(nbf.v4.new_code_cell("""# 1B. Counterfactual Helper
+def find_minimal_counterfactual(
+    model,
+    row_df,
+    feature_names,
+    reference_df,
+    target_class,
+    threshold=0.5,
+    max_features_to_change=2,
+    grid_points=31
+):
+    row = row_df.iloc[0].copy()
+    orig_proba = float(model.predict_proba(row_df[feature_names])[:, 1][0])
+    orig_pred = int(orig_proba >= threshold)
+    if orig_pred == target_class:
+        return None
+
+    feat_std = reference_df[feature_names].std(ddof=0).replace(0, 1.0)
+    grids = {f: np.linspace(reference_df[f].min(), reference_df[f].max(), grid_points) for f in feature_names}
+
+    best = None
+
+    for f in feature_names:
+        for v in grids[f]:
+            cand = row.copy()
+            cand[f] = float(v)
+            cand_df = pd.DataFrame([cand])[feature_names]
+            p1 = float(model.predict_proba(cand_df)[:, 1][0])
+            pred = int(p1 >= threshold)
+            if pred != target_class:
+                continue
+
+            delta = abs(float(v) - float(row[f])) / float(feat_std[f])
+            candidate = {'changed_features': [f], 'new_values': {f: float(v)}, 'distance': float(delta), 'new_proba': p1}
+            if (best is None) or (candidate['distance'] < best['distance']):
+                best = candidate
+
+    if best is not None or max_features_to_change < 2:
+        return {'orig_proba': orig_proba, 'orig_pred': orig_pred, **best} if best is not None else None
+
+    for i in range(len(feature_names)):
+        f1 = feature_names[i]
+        for j in range(i + 1, len(feature_names)):
+            f2 = feature_names[j]
+            for v1 in grids[f1]:
+                for v2 in grids[f2]:
+                    cand = row.copy()
+                    cand[f1] = float(v1)
+                    cand[f2] = float(v2)
+                    cand_df = pd.DataFrame([cand])[feature_names]
+                    p1 = float(model.predict_proba(cand_df)[:, 1][0])
+                    pred = int(p1 >= threshold)
+                    if pred != target_class:
+                        continue
+
+                    delta = (
+                        abs(float(v1) - float(row[f1])) / float(feat_std[f1]) +
+                        abs(float(v2) - float(row[f2])) / float(feat_std[f2])
+                    )
+                    candidate = {
+                        'changed_features': [f1, f2],
+                        'new_values': {f1: float(v1), f2: float(v2)},
+                        'distance': float(delta),
+                        'new_proba': p1
+                    }
+                    if (best is None) or (candidate['distance'] < best['distance']):
+                        best = candidate
+
+    return {'orig_proba': orig_proba, 'orig_pred': orig_pred, **best} if best is not None else None
+
+
+def build_counterfactuals_for_misclassifications(
+    model_name,
+    model,
+    X_test_df,
+    y_true_s,
+    y_pred_s,
+    y_proba,
+    feature_names,
+    reference_df,
+    threshold=0.5,
+    max_features_to_change=2,
+    grid_points=31
+):
+    rows = []
+    y_proba_s = pd.Series(y_proba).reset_index(drop=True)
+
+    fp_indices = list(np.where((y_true_s == 0) & (y_pred_s == 1))[0])
+    fn_indices = list(np.where((y_true_s == 1) & (y_pred_s == 0))[0])
+
+    for idx, p_type in [(i, 'False_Positive') for i in fp_indices] + [(i, 'False_Negative') for i in fn_indices]:
+        target_class = 0 if p_type == 'False_Positive' else 1
+        row_df = X_test_df.iloc[[idx]][feature_names]
+
+        cf = find_minimal_counterfactual(
+            model=model,
+            row_df=row_df,
+            feature_names=feature_names,
+            reference_df=reference_df,
+            target_class=target_class,
+            threshold=threshold,
+            max_features_to_change=max_features_to_change,
+            grid_points=grid_points
+        )
+
+        base = {
+            'Model': model_name,
+            'Patient': p_type.replace('_', ' '),
+            'Sample Index': int(idx),
+            'Actual': int(y_true_s.iloc[idx]),
+            'Predicted': int(y_pred_s.iloc[idx]),
+            'Original P(Diabetes)': round(float(y_proba_s.iloc[idx]), 4),
+            'Target Class': int(target_class)
+        }
+
+        if cf is None:
+            rows.append({
+                **base,
+                'Counterfactual Found': False,
+                'Changed Feature Count': np.nan,
+                'Changed Features': '',
+                'Changes': '',
+                'Counterfactual P(Diabetes)': np.nan,
+                'Normalized Distance': np.nan
+            })
+            continue
+
+        changes_txt = "; ".join(
+            [f"{f}: {row_df.iloc[0][f]:.2f} -> {cf['new_values'][f]:.2f}" for f in cf['changed_features']]
+        )
+
+        rows.append({
+            **base,
+            'Counterfactual Found': True,
+            'Changed Feature Count': len(cf['changed_features']),
+            'Changed Features': " | ".join(cf['changed_features']),
+            'Changes': changes_txt,
+            'Counterfactual P(Diabetes)': round(cf['new_proba'], 4),
+            'Normalized Distance': round(cf['distance'], 4)
+        })
+
+    return pd.DataFrame(rows)
+"""))
+
     # =========================================================================
     # PART A: XGBOOST + RFE
     # =========================================================================
@@ -310,6 +454,141 @@ plt.savefig('phase3_xgb_agreement_bar.png', dpi=150, bbox_inches='tight')
 plt.show()
 """))
 
+    cells.append(nbf.v4.new_code_cell("""# A4B. XGBoost Explanation Stability Across Reruns (SHAP=15, LIME=25)
+def _top_k_names_from_vector(values, feature_names, k=3):
+    idx = np.argsort(np.abs(values))[-k:][::-1]
+    return [feature_names[i] for i in idx]
+
+def _jaccard(a, b):
+    sa, sb = set(a), set(b)
+    union = len(sa | sb)
+    return (len(sa & sb) / union) if union else 1.0
+
+def run_local_stability_analysis(
+    model_name,
+    feature_names,
+    patient_dict,
+    X_test_df,
+    shap_explainer,
+    model_predict_proba_fn,
+    lime_train_values,
+    shap_runs=15,
+    lime_runs=25,
+    top_k=3
+):
+    records = []
+    for p_type, idx in patient_dict.items():
+        if idx is None:
+            continue
+
+        row_df = X_test_df.iloc[[idx]]
+        row_vec = row_df.iloc[0].values
+
+        shap_top_patterns = []
+        shap_weight_vectors = []
+        for _ in range(shap_runs):
+            obj = shap_explainer(row_df)
+            sv = obj[0, :, 1] if len(obj.shape) == 3 else obj[0]
+            vals = np.array(sv.values, dtype=float)
+            shap_weight_vectors.append(vals)
+            shap_top_patterns.append(tuple(_top_k_names_from_vector(vals, feature_names, k=top_k)))
+
+        shap_ref = shap_weight_vectors[0]
+        shap_ref_top = shap_top_patterns[0]
+        shap_jaccards = [_jaccard(shap_ref_top, t) for t in shap_top_patterns[1:]]
+        shap_spearman = [
+            pd.Series(np.abs(shap_ref)).corr(pd.Series(np.abs(v)), method='spearman')
+            for v in shap_weight_vectors[1:]
+        ]
+        shap_mode, shap_mode_count = Counter(shap_top_patterns).most_common(1)[0]
+
+        records.append({
+            'Model': model_name,
+            'Patient': p_type.replace('_', ' '),
+            'Explainer': 'SHAP',
+            'Runs': shap_runs,
+            'TopK': top_k,
+            'Unique TopK Patterns': len(set(shap_top_patterns)),
+            'Mode TopK Pattern': " | ".join(shap_mode),
+            'Mode Pattern Frequency (%)': round(100 * shap_mode_count / shap_runs, 2),
+            'Mean Jaccard vs Run1': round(float(np.mean(shap_jaccards)) if shap_jaccards else 1.0, 4),
+            'Std Jaccard vs Run1': round(float(np.std(shap_jaccards)) if shap_jaccards else 0.0, 4),
+            'Mean Spearman(|w|) vs Run1': round(float(np.nanmean(shap_spearman)) if shap_spearman else 1.0, 4)
+        })
+
+        lime_top_patterns = []
+        lime_weight_vectors = []
+        for r in range(lime_runs):
+            lime_local = lime.lime_tabular.LimeTabularExplainer(
+                lime_train_values,
+                feature_names=feature_names,
+                class_names=['No', 'Yes'],
+                mode='classification',
+                random_state=RANDOM_SEED + r
+            )
+            exp = lime_local.explain_instance(row_vec, model_predict_proba_fn, num_features=len(feature_names))
+            lime_map = dict(exp.as_map()[1])
+            vals = np.array([lime_map.get(i, 0.0) for i in range(len(feature_names))], dtype=float)
+            lime_weight_vectors.append(vals)
+            lime_top_patterns.append(tuple(_top_k_names_from_vector(vals, feature_names, k=top_k)))
+
+        lime_ref = lime_weight_vectors[0]
+        lime_ref_top = lime_top_patterns[0]
+        lime_jaccards = [_jaccard(lime_ref_top, t) for t in lime_top_patterns[1:]]
+        lime_spearman = [
+            pd.Series(np.abs(lime_ref)).corr(pd.Series(np.abs(v)), method='spearman')
+            for v in lime_weight_vectors[1:]
+        ]
+        lime_mode, lime_mode_count = Counter(lime_top_patterns).most_common(1)[0]
+
+        records.append({
+            'Model': model_name,
+            'Patient': p_type.replace('_', ' '),
+            'Explainer': 'LIME',
+            'Runs': lime_runs,
+            'TopK': top_k,
+            'Unique TopK Patterns': len(set(lime_top_patterns)),
+            'Mode TopK Pattern': " | ".join(lime_mode),
+            'Mode Pattern Frequency (%)': round(100 * lime_mode_count / lime_runs, 2),
+            'Mean Jaccard vs Run1': round(float(np.mean(lime_jaccards)) if lime_jaccards else 1.0, 4),
+            'Std Jaccard vs Run1': round(float(np.std(lime_jaccards)) if lime_jaccards else 0.0, 4),
+            'Mean Spearman(|w|) vs Run1': round(float(np.nanmean(lime_spearman)) if lime_spearman else 1.0, 4)
+        })
+
+    return pd.DataFrame(records)
+
+stability_xgb = run_local_stability_analysis(
+    model_name='XGBoost + RFE',
+    feature_names=rfe_features,
+    patient_dict=xgb_patients,
+    X_test_df=X_te_xgb_df,
+    shap_explainer=explainer_xgb,
+    model_predict_proba_fn=xgb_model.predict_proba,
+    lime_train_values=X_train_xgb.values,
+    shap_runs=15,
+    lime_runs=25,
+    top_k=3
+)
+
+print("\\nXGBoost Stability (same patient, repeated local explanations):")
+display(stability_xgb.sort_values(['Explainer', 'Patient']))
+stability_xgb.to_csv('phase3_xgb_explanation_stability.csv', index=False)
+
+plt.figure(figsize=(8,4))
+sns.barplot(
+    data=stability_xgb,
+    x='Patient',
+    y='Mode Pattern Frequency (%)',
+    hue='Explainer',
+    palette=['#2ca02c', '#ff7f0e']
+)
+plt.ylim(0, 100)
+plt.title('XGBoost: Top-3 Explanation Stability (SHAP=15, LIME=25)')
+plt.ylabel('Most Frequent Top-3 Pattern (%)')
+plt.savefig('phase3_xgb_stability_bar.png', dpi=150, bbox_inches='tight')
+plt.show()
+"""))
+
     cells.append(nbf.v4.new_code_cell("""# A5. XGBoost Diagnostic Narrative
 print("=================== XGBOOST NARRATIVES ===================")
 for p, idx in xgb_patients.items():
@@ -527,6 +806,39 @@ plt.savefig('phase3_lgb_agreement_bar.png', dpi=150, bbox_inches='tight')
 plt.show()
 """))
 
+    cells.append(nbf.v4.new_code_cell("""# B4B. LightGBM Explanation Stability Across Reruns (SHAP=15, LIME=25)
+stability_lgb = run_local_stability_analysis(
+    model_name='LightGBM + Boruta',
+    feature_names=boruta_features,
+    patient_dict=lgb_patients,
+    X_test_df=X_te_lgb_df,
+    shap_explainer=explainer_lgb,
+    model_predict_proba_fn=lgbm_model.predict_proba,
+    lime_train_values=X_train_lgb.values,
+    shap_runs=15,
+    lime_runs=25,
+    top_k=3
+)
+
+print("\\nLightGBM Stability (same patient, repeated local explanations):")
+display(stability_lgb.sort_values(['Explainer', 'Patient']))
+stability_lgb.to_csv('phase3_lgb_explanation_stability.csv', index=False)
+
+plt.figure(figsize=(8,4))
+sns.barplot(
+    data=stability_lgb,
+    x='Patient',
+    y='Mode Pattern Frequency (%)',
+    hue='Explainer',
+    palette=['#2ca02c', '#ff7f0e']
+)
+plt.ylim(0, 100)
+plt.title('LightGBM: Top-3 Explanation Stability (SHAP=15, LIME=25)')
+plt.ylabel('Most Frequent Top-3 Pattern (%)')
+plt.savefig('phase3_lgb_stability_bar.png', dpi=150, bbox_inches='tight')
+plt.show()
+"""))
+
     cells.append(nbf.v4.new_code_cell("""# B5. LightGBM Diagnostic Narrative
 print("=================== LIGHTGBM NARRATIVES ===================")
 for p, idx in lgb_patients.items():
@@ -557,6 +869,65 @@ for p, idx in lgb_patients.items():
     else:
         print(f"The model missed this diabetic diagnosis. The primary factor, {top_f1}, was within the normal range ({row[top_f1]:.1f}), "
               "which suppressed the risk score despite the underlying diabetic status.")
+"""))
+
+    cells.append(nbf.v4.new_code_cell("""# B5B. Counterfactual Explanations (all FP/FN)
+print("\\n=================== COUNTERFACTUALS: XGBOOST (ALL FP/FN) ===================")
+cf_xgb = build_counterfactuals_for_misclassifications(
+    model_name='XGBoost + RFE',
+    model=xgb_model,
+    X_test_df=X_te_xgb_df,
+    y_true_s=y_test_s,
+    y_pred_s=y_pred_s,
+    y_proba=y_proba_xgb,
+    feature_names=rfe_features,
+    reference_df=X_train_xgb,
+    threshold=0.5,
+    max_features_to_change=2,
+    grid_points=31
+)
+
+if cf_xgb.empty:
+    print("No FP/FN cases found for XGBoost.")
+else:
+    print(
+        f"XGBoost misclassifications analyzed: {len(cf_xgb)} "
+        f"(CF found for {int(cf_xgb['Counterfactual Found'].sum())} cases)"
+    )
+    display(cf_xgb.sort_values(['Patient', 'Normalized Distance', 'Sample Index'], na_position='last'))
+    cf_xgb.to_csv('phase3_xgb_counterfactuals.csv', index=False)
+    print("✅ Saved detailed XGBoost counterfactuals to phase3_xgb_counterfactuals.csv")
+
+print("\\n=================== COUNTERFACTUALS: LIGHTGBM (ALL FP/FN) ===================")
+cf_lgb = build_counterfactuals_for_misclassifications(
+    model_name='LightGBM + Boruta',
+    model=lgbm_model,
+    X_test_df=X_te_lgb_df,
+    y_true_s=y_test_s2,
+    y_pred_s=y_pred_s2,
+    y_proba=y_proba_lgb,
+    feature_names=boruta_features,
+    reference_df=X_train_lgb,
+    threshold=0.5,
+    max_features_to_change=2,
+    grid_points=31
+)
+
+if cf_lgb.empty:
+    print("No FP/FN cases found for LightGBM.")
+else:
+    print(
+        f"LightGBM misclassifications analyzed: {len(cf_lgb)} "
+        f"(CF found for {int(cf_lgb['Counterfactual Found'].sum())} cases)"
+    )
+    display(cf_lgb.sort_values(['Patient', 'Normalized Distance', 'Sample Index'], na_position='last'))
+    cf_lgb.to_csv('phase3_lgb_counterfactuals.csv', index=False)
+    print("✅ Saved detailed LightGBM counterfactuals to phase3_lgb_counterfactuals.csv")
+
+cf_all = pd.concat([cf_xgb, cf_lgb], ignore_index=True)
+if not cf_all.empty:
+    cf_all.to_csv('phase3_counterfactuals.csv', index=False)
+    print("✅ Saved combined counterfactual summary to phase3_counterfactuals.csv")
 """))
 
     # ========================== PART C: CUSTOM AUDIT ==========================
@@ -662,3 +1033,4 @@ except ImportError:
 
 create_nb()
 print("Massive end-to-end split notebook fully constructed.")
+
