@@ -281,6 +281,141 @@ plt.savefig('phase3_xgb_agreement_bar.png', dpi=150, bbox_inches='tight')
 plt.show()
 """))
 
+    cells.append(nbf.v4.new_code_cell("""# A4B. XGBoost Explanation Stability Across Reruns (SHAP=15, LIME=25)
+def _top_k_names_from_vector(values, feature_names, k=3):
+    idx = np.argsort(np.abs(values))[-k:][::-1]
+    return [feature_names[i] for i in idx]
+
+def _jaccard(a, b):
+    sa, sb = set(a), set(b)
+    union = len(sa | sb)
+    return (len(sa & sb) / union) if union else 1.0
+
+def run_local_stability_analysis(
+    model_name,
+    feature_names,
+    patient_dict,
+    X_test_df,
+    shap_explainer,
+    model_predict_proba_fn,
+    lime_train_values,
+    shap_runs=15,
+    lime_runs=25,
+    top_k=3
+):
+    records = []
+    for p_type, idx in patient_dict.items():
+        if idx is None:
+            continue
+
+        row_df = X_test_df.iloc[[idx]]
+        row_vec = row_df.iloc[0].values
+
+        shap_top_patterns = []
+        shap_weight_vectors = []
+        for _ in range(shap_runs):
+            obj = shap_explainer(row_df)
+            sv = obj[0, :, 1] if len(obj.shape) == 3 else obj[0]
+            vals = np.array(sv.values, dtype=float)
+            shap_weight_vectors.append(vals)
+            shap_top_patterns.append(tuple(_top_k_names_from_vector(vals, feature_names, k=top_k)))
+
+        shap_ref = shap_weight_vectors[0]
+        shap_ref_top = shap_top_patterns[0]
+        shap_jaccards = [_jaccard(shap_ref_top, t) for t in shap_top_patterns[1:]]
+        shap_spearman = [
+            pd.Series(np.abs(shap_ref)).corr(pd.Series(np.abs(v)), method='spearman')
+            for v in shap_weight_vectors[1:]
+        ]
+        shap_mode, shap_mode_count = Counter(shap_top_patterns).most_common(1)[0]
+
+        records.append({
+            'Model': model_name,
+            'Patient': p_type.replace('_', ' '),
+            'Explainer': 'SHAP',
+            'Runs': shap_runs,
+            'TopK': top_k,
+            'Unique TopK Patterns': len(set(shap_top_patterns)),
+            'Mode TopK Pattern': " | ".join(shap_mode),
+            'Mode Pattern Frequency (%)': round(100 * shap_mode_count / shap_runs, 2),
+            'Mean Jaccard vs Run1': round(float(np.mean(shap_jaccards)) if shap_jaccards else 1.0, 4),
+            'Std Jaccard vs Run1': round(float(np.std(shap_jaccards)) if shap_jaccards else 0.0, 4),
+            'Mean Spearman(|w|) vs Run1': round(float(np.nanmean(shap_spearman)) if shap_spearman else 1.0, 4)
+        })
+
+        lime_top_patterns = []
+        lime_weight_vectors = []
+        for r in range(lime_runs):
+            lime_local = lime.lime_tabular.LimeTabularExplainer(
+                lime_train_values,
+                feature_names=feature_names,
+                class_names=['No', 'Yes'],
+                mode='classification',
+                random_state=RANDOM_SEED + r
+            )
+            exp = lime_local.explain_instance(row_vec, model_predict_proba_fn, num_features=len(feature_names))
+            lime_map = dict(exp.as_map()[1])
+            vals = np.array([lime_map.get(i, 0.0) for i in range(len(feature_names))], dtype=float)
+            lime_weight_vectors.append(vals)
+            lime_top_patterns.append(tuple(_top_k_names_from_vector(vals, feature_names, k=top_k)))
+
+        lime_ref = lime_weight_vectors[0]
+        lime_ref_top = lime_top_patterns[0]
+        lime_jaccards = [_jaccard(lime_ref_top, t) for t in lime_top_patterns[1:]]
+        lime_spearman = [
+            pd.Series(np.abs(lime_ref)).corr(pd.Series(np.abs(v)), method='spearman')
+            for v in lime_weight_vectors[1:]
+        ]
+        lime_mode, lime_mode_count = Counter(lime_top_patterns).most_common(1)[0]
+
+        records.append({
+            'Model': model_name,
+            'Patient': p_type.replace('_', ' '),
+            'Explainer': 'LIME',
+            'Runs': lime_runs,
+            'TopK': top_k,
+            'Unique TopK Patterns': len(set(lime_top_patterns)),
+            'Mode TopK Pattern': " | ".join(lime_mode),
+            'Mode Pattern Frequency (%)': round(100 * lime_mode_count / lime_runs, 2),
+            'Mean Jaccard vs Run1': round(float(np.mean(lime_jaccards)) if lime_jaccards else 1.0, 4),
+            'Std Jaccard vs Run1': round(float(np.std(lime_jaccards)) if lime_jaccards else 0.0, 4),
+            'Mean Spearman(|w|) vs Run1': round(float(np.nanmean(lime_spearman)) if lime_spearman else 1.0, 4)
+        })
+
+    return pd.DataFrame(records)
+
+stability_xgb = run_local_stability_analysis(
+    model_name='XGBoost + RFE',
+    feature_names=rfe_features,
+    patient_dict=xgb_patients,
+    X_test_df=X_te_xgb_df,
+    shap_explainer=explainer_xgb,
+    model_predict_proba_fn=xgb_model.predict_proba,
+    lime_train_values=X_train_xgb.values,
+    shap_runs=15,
+    lime_runs=25,
+    top_k=3
+)
+
+print("\\nXGBoost Stability (same patient, repeated local explanations):")
+display(stability_xgb.sort_values(['Explainer', 'Patient']))
+stability_xgb.to_csv('phase3_xgb_explanation_stability.csv', index=False)
+
+plt.figure(figsize=(8,4))
+sns.barplot(
+    data=stability_xgb,
+    x='Patient',
+    y='Mode Pattern Frequency (%)',
+    hue='Explainer',
+    palette=['#2ca02c', '#ff7f0e']
+)
+plt.ylim(0, 100)
+plt.title('XGBoost: Top-3 Explanation Stability (SHAP=15, LIME=25)')
+plt.ylabel('Most Frequent Top-3 Pattern (%)')
+plt.savefig('phase3_xgb_stability_bar.png', dpi=150, bbox_inches='tight')
+plt.show()
+"""))
+
     cells.append(nbf.v4.new_code_cell("""# A5. XGBoost Diagnostic Narrative
 print("=================== XGBOOST NARRATIVES ===================")
 for p, idx in xgb_patients.items():
@@ -495,6 +630,39 @@ for i, p in enumerate([c['Patient'] for c in agreement_lgb]):
 plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
 plt.suptitle("LightGBM SHAP vs LIME Exact Magnitudes", y=1.05)
 plt.savefig('phase3_lgb_agreement_bar.png', dpi=150, bbox_inches='tight')
+plt.show()
+"""))
+
+    cells.append(nbf.v4.new_code_cell("""# B4B. LightGBM Explanation Stability Across Reruns (SHAP=15, LIME=25)
+stability_lgb = run_local_stability_analysis(
+    model_name='LightGBM + Boruta',
+    feature_names=boruta_features,
+    patient_dict=lgb_patients,
+    X_test_df=X_te_lgb_df,
+    shap_explainer=explainer_lgb,
+    model_predict_proba_fn=lgbm_model.predict_proba,
+    lime_train_values=X_train_lgb.values,
+    shap_runs=15,
+    lime_runs=25,
+    top_k=3
+)
+
+print("\\nLightGBM Stability (same patient, repeated local explanations):")
+display(stability_lgb.sort_values(['Explainer', 'Patient']))
+stability_lgb.to_csv('phase3_lgb_explanation_stability.csv', index=False)
+
+plt.figure(figsize=(8,4))
+sns.barplot(
+    data=stability_lgb,
+    x='Patient',
+    y='Mode Pattern Frequency (%)',
+    hue='Explainer',
+    palette=['#2ca02c', '#ff7f0e']
+)
+plt.ylim(0, 100)
+plt.title('LightGBM: Top-3 Explanation Stability (SHAP=15, LIME=25)')
+plt.ylabel('Most Frequent Top-3 Pattern (%)')
+plt.savefig('phase3_lgb_stability_bar.png', dpi=150, bbox_inches='tight')
 plt.show()
 """))
 
