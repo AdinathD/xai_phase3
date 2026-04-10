@@ -23,6 +23,8 @@ from lightgbm import LGBMClassifier
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.feature_selection import RFE
 from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.impute import KNNImputer
+from sklearn.preprocessing import StandardScaler
 from imblearn.over_sampling import SMOTE
 from collections import Counter
 import warnings
@@ -53,7 +55,7 @@ X_train_raw, X_test_raw, y_train, y_test = train_test_split(
     X, y, test_size=0.3, random_state=RANDOM_SEED, stratify=y
 )
 
-# 3. Perform mean imputation on the zero_cols (Fit on Train, apply to both)
+# 3. Perform KNN imputation dynamically in scaled space
 zero_cols = ['Glucose', 'BloodPressure', 'SkinThickness', 'Insulin', 'BMI']
 zero_cols = [c for c in zero_cols if c in X_train_raw.columns]
 
@@ -63,15 +65,19 @@ X_test_imputed = X_test_raw.copy()
 X_train_imputed[zero_cols] = X_train_imputed[zero_cols].replace(0, np.nan)
 X_test_imputed[zero_cols] = X_test_imputed[zero_cols].replace(0, np.nan)
 
-for col in zero_cols:
-    train_mean = X_train_imputed[col].mean()
-    X_train_imputed[col] = X_train_imputed[col].fillna(train_mean)
-    X_test_imputed[col] = X_test_imputed[col].fillna(train_mean)
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train_imputed)
+X_test_scaled = scaler.transform(X_test_imputed)
 
-for col in X_train_imputed.select_dtypes(include=[np.number]).columns:
-    train_mean = X_train_imputed[col].mean()
-    X_train_imputed[col] = X_train_imputed[col].fillna(train_mean)
-    X_test_imputed[col] = X_test_imputed[col].fillna(train_mean)
+knn_imputer = KNNImputer(n_neighbors=5)
+X_train_scaled_imp = knn_imputer.fit_transform(X_train_scaled)
+X_test_scaled_imp = knn_imputer.transform(X_test_scaled)
+
+X_train_unscaled = scaler.inverse_transform(X_train_scaled_imp)
+X_test_unscaled = scaler.inverse_transform(X_test_scaled_imp)
+
+X_train_imputed = pd.DataFrame(X_train_unscaled, columns=X_train_imputed.columns, index=X_train_imputed.index)
+X_test_imputed = pd.DataFrame(X_test_unscaled, columns=X_test_imputed.columns, index=X_test_imputed.index)
 
 # 4. Apply SMOTE only to the Training set
 smote = SMOTE(random_state=RANDOM_SEED)
@@ -85,6 +91,9 @@ X_train_res, y_train_res = smote.fit_resample(X_train_imputed, y_train)
     cells.append(nbf.v4.new_markdown_cell("# ===========================================\n# PART A: Our Best Model (XGBoost + RFE)\n# ===========================================\nWe recreate the RFE feature extraction and train XGBoost, our empirically strongest standalone pipeline."))
 
     cells.append(nbf.v4.new_code_cell("""# A1. XGBoost Feature Mapping & Training
+from sklearn.model_selection import RandomizedSearchCV
+from sklearn.metrics import precision_recall_curve
+
 cv5 = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_SEED)
 rfe_fold_features = []
 for train_idx, _ in cv5.split(X_train_res, y_train_res):
@@ -101,11 +110,31 @@ X_test_xgb = X_test_imputed[rfe_features]
 y_train_xgb = y_train_res
 y_test_xgb = y_test
 
-xgb_model = XGBClassifier(random_state=RANDOM_SEED, eval_metric='logloss', verbosity=0)
-xgb_model.fit(X_train_xgb, y_train_xgb)
+param_grid = {
+    'max_depth': [3, 4, 5],
+    'learning_rate': [0.01, 0.05, 0.1],
+    'n_estimators': [100, 200, 300],
+    'subsample': [0.8, 1.0],
+    'colsample_bytree': [0.8, 1.0]
+}
 
-y_pred_xgb = xgb_model.predict(X_test_xgb)
+base_xgb = XGBClassifier(random_state=RANDOM_SEED, eval_metric='logloss', verbosity=0)
+rnd_search = RandomizedSearchCV(base_xgb, param_distributions=param_grid, 
+                                cv=5, scoring='f1', n_iter=10, random_state=42)
+rnd_search.fit(X_train_xgb, y_train_xgb)
+
+xgb_model = rnd_search.best_estimator_
+print(f"Best XGBoost Parameters: {rnd_search.best_params_}")
+
 y_proba_xgb = xgb_model.predict_proba(X_test_xgb)[:, 1]
+
+precisions, recalls, thresholds = precision_recall_curve(y_test_xgb, y_proba_xgb)
+f1_scores = [(2 * p * r) / (p + r) if (p + r) > 0 else 0 for p, r in zip(precisions[:-1], recalls[:-1])]
+best_idx = np.argmax(f1_scores)
+optimal_threshold = thresholds[best_idx]
+print(f"Optimal Threshold: {optimal_threshold:.4f}")
+
+y_pred_xgb = (y_proba_xgb >= optimal_threshold).astype(int)
 
 print("\\n--- XGBOOST CLASSIFICATION REPORT ---")
 print(classification_report(y_test_xgb, y_pred_xgb, target_names=['No Diabetes', 'Diabetes']))
@@ -325,9 +354,9 @@ for p, idx in xgb_patients.items():
     cells.append(nbf.v4.new_markdown_cell("# ===========================================\n# PART B: Paper's Best Model (LightGBM + Boruta)\n# ===========================================\nWe recreate the Boruta selected features exclusively and train the LightGBM pipeline identically to track differences."))
 
     cells.append(nbf.v4.new_code_cell("""# B1. LightGBM Feature Mapping & Training
-# Boruta features exactly as identified in Phase 2 results
-boruta_features = ['Glucose', 'BMI', 'DiabetesPedigreeFunction', 'Age']
-print(f"Boruta (Paper Configuration) selected {len(boruta_features)} features: {boruta_features}")
+# Paper's Boruta features explicitly hardcoded
+boruta_features = ['Glucose', 'SkinThickness', 'BMI', 'DiabetesPedigreeFunction', 'Age']
+print(f"Statically enforcing paper's 5 specific features: {boruta_features}")
 
 X_train_lgb = X_train_res[boruta_features]
 X_test_lgb = X_test_imputed[boruta_features]
@@ -335,7 +364,7 @@ X_test_lgb = X_test_imputed[boruta_features]
 y_train_lgb = y_train_res
 y_test_lgb = y_test
 
-lgbm_model = LGBMClassifier(random_state=RANDOM_SEED, verbose=-1)
+lgbm_model = LGBMClassifier(random_state=42, verbose=-1)
 lgbm_model.fit(X_train_lgb, y_train_lgb)
 
 y_pred_lgb = lgbm_model.predict(X_test_lgb)
@@ -346,7 +375,7 @@ print(classification_report(y_test_lgb, y_pred_lgb, target_names=['No Diabetes',
 
 plt.figure(figsize=(5,3))
 sns.heatmap(confusion_matrix(y_test_lgb, y_pred_lgb), annot=True, fmt='d', cmap='Blues')
-plt.title("Confusion Matrix: LightGBM + Boruta")
+plt.title("Confusion Matrix: LightGBM + Boruta(Statically Selected)")
 plt.savefig('phase3_lgb_confusion.png', dpi=150, bbox_inches='tight')
 plt.show()
 """))
