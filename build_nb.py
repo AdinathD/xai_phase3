@@ -78,6 +78,150 @@ smote = SMOTE(random_state=RANDOM_SEED)
 X_train_res, y_train_res = smote.fit_resample(X_train_imputed, y_train)
 """))
 
+    cells.append(nbf.v4.new_code_cell("""# 1B. Counterfactual Helper
+def find_minimal_counterfactual(
+    model,
+    row_df,
+    feature_names,
+    reference_df,
+    target_class,
+    threshold=0.5,
+    max_features_to_change=2,
+    grid_points=31
+):
+    row = row_df.iloc[0].copy()
+    orig_proba = float(model.predict_proba(row_df[feature_names])[:, 1][0])
+    orig_pred = int(orig_proba >= threshold)
+    if orig_pred == target_class:
+        return None
+
+    feat_std = reference_df[feature_names].std(ddof=0).replace(0, 1.0)
+    grids = {f: np.linspace(reference_df[f].min(), reference_df[f].max(), grid_points) for f in feature_names}
+
+    best = None
+
+    for f in feature_names:
+        for v in grids[f]:
+            cand = row.copy()
+            cand[f] = float(v)
+            cand_df = pd.DataFrame([cand])[feature_names]
+            p1 = float(model.predict_proba(cand_df)[:, 1][0])
+            pred = int(p1 >= threshold)
+            if pred != target_class:
+                continue
+
+            delta = abs(float(v) - float(row[f])) / float(feat_std[f])
+            candidate = {'changed_features': [f], 'new_values': {f: float(v)}, 'distance': float(delta), 'new_proba': p1}
+            if (best is None) or (candidate['distance'] < best['distance']):
+                best = candidate
+
+    if best is not None or max_features_to_change < 2:
+        return {'orig_proba': orig_proba, 'orig_pred': orig_pred, **best} if best is not None else None
+
+    for i in range(len(feature_names)):
+        f1 = feature_names[i]
+        for j in range(i + 1, len(feature_names)):
+            f2 = feature_names[j]
+            for v1 in grids[f1]:
+                for v2 in grids[f2]:
+                    cand = row.copy()
+                    cand[f1] = float(v1)
+                    cand[f2] = float(v2)
+                    cand_df = pd.DataFrame([cand])[feature_names]
+                    p1 = float(model.predict_proba(cand_df)[:, 1][0])
+                    pred = int(p1 >= threshold)
+                    if pred != target_class:
+                        continue
+
+                    delta = (
+                        abs(float(v1) - float(row[f1])) / float(feat_std[f1]) +
+                        abs(float(v2) - float(row[f2])) / float(feat_std[f2])
+                    )
+                    candidate = {
+                        'changed_features': [f1, f2],
+                        'new_values': {f1: float(v1), f2: float(v2)},
+                        'distance': float(delta),
+                        'new_proba': p1
+                    }
+                    if (best is None) or (candidate['distance'] < best['distance']):
+                        best = candidate
+
+    return {'orig_proba': orig_proba, 'orig_pred': orig_pred, **best} if best is not None else None
+
+
+def build_counterfactuals_for_misclassifications(
+    model_name,
+    model,
+    X_test_df,
+    y_true_s,
+    y_pred_s,
+    y_proba,
+    feature_names,
+    reference_df,
+    threshold=0.5,
+    max_features_to_change=2,
+    grid_points=31
+):
+    rows = []
+    y_proba_s = pd.Series(y_proba).reset_index(drop=True)
+
+    fp_indices = list(np.where((y_true_s == 0) & (y_pred_s == 1))[0])
+    fn_indices = list(np.where((y_true_s == 1) & (y_pred_s == 0))[0])
+
+    for idx, p_type in [(i, 'False_Positive') for i in fp_indices] + [(i, 'False_Negative') for i in fn_indices]:
+        target_class = 0 if p_type == 'False_Positive' else 1
+        row_df = X_test_df.iloc[[idx]][feature_names]
+
+        cf = find_minimal_counterfactual(
+            model=model,
+            row_df=row_df,
+            feature_names=feature_names,
+            reference_df=reference_df,
+            target_class=target_class,
+            threshold=threshold,
+            max_features_to_change=max_features_to_change,
+            grid_points=grid_points
+        )
+
+        base = {
+            'Model': model_name,
+            'Patient': p_type.replace('_', ' '),
+            'Sample Index': int(idx),
+            'Actual': int(y_true_s.iloc[idx]),
+            'Predicted': int(y_pred_s.iloc[idx]),
+            'Original P(Diabetes)': round(float(y_proba_s.iloc[idx]), 4),
+            'Target Class': int(target_class)
+        }
+
+        if cf is None:
+            rows.append({
+                **base,
+                'Counterfactual Found': False,
+                'Changed Feature Count': np.nan,
+                'Changed Features': '',
+                'Changes': '',
+                'Counterfactual P(Diabetes)': np.nan,
+                'Normalized Distance': np.nan
+            })
+            continue
+
+        changes_txt = "; ".join(
+            [f"{f}: {row_df.iloc[0][f]:.2f} -> {cf['new_values'][f]:.2f}" for f in cf['changed_features']]
+        )
+
+        rows.append({
+            **base,
+            'Counterfactual Found': True,
+            'Changed Feature Count': len(cf['changed_features']),
+            'Changed Features': " | ".join(cf['changed_features']),
+            'Changes': changes_txt,
+            'Counterfactual P(Diabetes)': round(cf['new_proba'], 4),
+            'Normalized Distance': round(cf['distance'], 4)
+        })
+
+    return pd.DataFrame(rows)
+"""))
+
     # =========================================================================
     # PART A: XGBOOST + RFE
     # =========================================================================
@@ -698,6 +842,65 @@ for p, idx in lgb_patients.items():
               "which suppressed the risk score despite the underlying diabetic status.")
 """))
 
+    cells.append(nbf.v4.new_code_cell("""# B5B. Counterfactual Explanations (all FP/FN)
+print("\\n=================== COUNTERFACTUALS: XGBOOST (ALL FP/FN) ===================")
+cf_xgb = build_counterfactuals_for_misclassifications(
+    model_name='XGBoost + RFE',
+    model=xgb_model,
+    X_test_df=X_te_xgb_df,
+    y_true_s=y_test_s,
+    y_pred_s=y_pred_s,
+    y_proba=y_proba_xgb,
+    feature_names=rfe_features,
+    reference_df=X_train_xgb,
+    threshold=0.5,
+    max_features_to_change=2,
+    grid_points=31
+)
+
+if cf_xgb.empty:
+    print("No FP/FN cases found for XGBoost.")
+else:
+    print(
+        f"XGBoost misclassifications analyzed: {len(cf_xgb)} "
+        f"(CF found for {int(cf_xgb['Counterfactual Found'].sum())} cases)"
+    )
+    display(cf_xgb.sort_values(['Patient', 'Normalized Distance', 'Sample Index'], na_position='last'))
+    cf_xgb.to_csv('phase3_xgb_counterfactuals.csv', index=False)
+    print("✅ Saved detailed XGBoost counterfactuals to phase3_xgb_counterfactuals.csv")
+
+print("\\n=================== COUNTERFACTUALS: LIGHTGBM (ALL FP/FN) ===================")
+cf_lgb = build_counterfactuals_for_misclassifications(
+    model_name='LightGBM + Boruta',
+    model=lgbm_model,
+    X_test_df=X_te_lgb_df,
+    y_true_s=y_test_s2,
+    y_pred_s=y_pred_s2,
+    y_proba=y_proba_lgb,
+    feature_names=boruta_features,
+    reference_df=X_train_lgb,
+    threshold=0.5,
+    max_features_to_change=2,
+    grid_points=31
+)
+
+if cf_lgb.empty:
+    print("No FP/FN cases found for LightGBM.")
+else:
+    print(
+        f"LightGBM misclassifications analyzed: {len(cf_lgb)} "
+        f"(CF found for {int(cf_lgb['Counterfactual Found'].sum())} cases)"
+    )
+    display(cf_lgb.sort_values(['Patient', 'Normalized Distance', 'Sample Index'], na_position='last'))
+    cf_lgb.to_csv('phase3_lgb_counterfactuals.csv', index=False)
+    print("✅ Saved detailed LightGBM counterfactuals to phase3_lgb_counterfactuals.csv")
+
+cf_all = pd.concat([cf_xgb, cf_lgb], ignore_index=True)
+if not cf_all.empty:
+    cf_all.to_csv('phase3_counterfactuals.csv', index=False)
+    print("✅ Saved combined counterfactual summary to phase3_counterfactuals.csv")
+"""))
+
     # ========================== PART C: CUSTOM AUDIT ==========================
     cells.append(nbf.v4.new_markdown_cell("# ## PART C: Custom Instance Audit (User Choice)\nIf you have identified a specific patient from your test set (indices 0 to 230) and wish to perform a deep-dive independent of the automated confidence-based selection above, use this cell.\n\nSimply input the index and choose the model to deconstruct."))
     
@@ -801,3 +1004,4 @@ except ImportError:
 
 create_nb()
 print("Massive end-to-end split notebook fully constructed.")
+
